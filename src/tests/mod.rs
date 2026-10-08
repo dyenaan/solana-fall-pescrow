@@ -57,7 +57,7 @@ mod tests {
     }
 
     #[test]
-    pub fn test_make_instruction() {
+    pub fn test_make_and_cancel_instruction() {
         let (mut svm, payer) = setup();
 
         let program_id = program_id();
@@ -174,5 +174,79 @@ mod tests {
         assert_eq!(u64::from_le_bytes(d[96..104].try_into().unwrap()), amount_to_receive);
         assert_eq!(u64::from_le_bytes(d[104..112].try_into().unwrap()), amount_to_give);
         assert_eq!(d[112], bump);
+
+        let cancel_ix = Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(mint_a, false),
+                AccountMeta::new(escrow.0, false),
+                AccountMeta::new(vault, false),
+                AccountMeta::new(maker_ata_a, false),
+                AccountMeta::new_readonly(token_program, false),
+            ],
+            data: vec![2],
+        };
+
+        // A separate fee payer prevents the maker becoming a signer implicitly.
+        let attacker = Keypair::new();
+        svm.airdrop(&attacker.pubkey(), LAMPORTS_PER_SOL).unwrap();
+        let attacker_ata = CreateAssociatedTokenAccount::new(&mut svm, &attacker, &mint_a)
+            .owner(&attacker.pubkey()).send().unwrap();
+
+        let mut unsigned = cancel_ix.clone();
+        unsigned.accounts[0].is_signer = false;
+        let message = Message::new(&[unsigned], Some(&attacker.pubkey()));
+        let tx = Transaction::new(&[&attacker], message, svm.latest_blockhash());
+        let error = svm.send_transaction(tx).unwrap_err();
+        assert!(format!("{:?}", error.err).contains("MissingRequiredSignature"));
+
+        let mut wrong_maker = cancel_ix.clone();
+        wrong_maker.accounts[0] = AccountMeta::new(attacker.pubkey(), true);
+        let message = Message::new(&[wrong_maker], Some(&attacker.pubkey()));
+        let tx = Transaction::new(&[&attacker], message, svm.latest_blockhash());
+        let error = svm.send_transaction(tx).unwrap_err();
+        assert!(format!("{:?}", error.err).contains("InvalidAccountData"));
+
+        let mut wrong_mint = cancel_ix.clone();
+        wrong_mint.accounts[1] = AccountMeta::new_readonly(mint_b, false);
+        let message = Message::new(&[wrong_mint], Some(&attacker.pubkey()));
+        let tx = Transaction::new(&[&attacker, &payer], message, svm.latest_blockhash());
+        let error = svm.send_transaction(tx).unwrap_err();
+        assert!(format!("{:?}", error.err).contains("InvalidAccountData"));
+
+        let mut wrong_destination = cancel_ix.clone();
+        wrong_destination.accounts[4] = AccountMeta::new(attacker_ata, false);
+        let message = Message::new(&[wrong_destination], Some(&attacker.pubkey()));
+        let tx = Transaction::new(&[&attacker, &payer], message, svm.latest_blockhash());
+        let error = svm.send_transaction(tx).unwrap_err();
+        assert!(format!("{:?}", error.err).contains("IllegalOwner"));
+
+        // Failed attempts must leave the deposit intact.
+        let vault_account = svm.get_account(&vault).unwrap();
+        assert_eq!(spl_token_2022::state::Account::unpack(&vault_account.data).unwrap().amount, amount_to_give);
+        let rent_refund = vault_account.lamports + svm.get_account(&escrow.0).unwrap().lamports;
+        let maker_balance = svm.get_account(&payer.pubkey()).unwrap().lamports;
+
+        // The attacker pays the fee so the maker's exact rent refund is observable.
+        let message = Message::new(&[cancel_ix], Some(&attacker.pubkey()));
+        let tx = Transaction::new(&[&attacker, &payer], message, svm.latest_blockhash());
+        svm.send_transaction(tx).unwrap();
+
+        let maker_tokens = svm.get_account(&maker_ata_a).unwrap();
+        assert_eq!(spl_token_2022::state::Account::unpack(&maker_tokens.data).unwrap().amount, 1000000000);
+        assert_eq!(svm.get_account(&payer.pubkey()).unwrap().lamports, maker_balance + rent_refund);
+        for address in [vault, escrow.0] {
+            if let Some(account) = svm.get_account(&address) {
+                assert_eq!(account.lamports, 0);
+                assert!(account.data.is_empty());
+            }
+        }
+
+        let unsupported = Instruction { program_id, accounts: vec![], data: vec![3] };
+        let message = Message::new(&[unsupported], Some(&attacker.pubkey()));
+        let tx = Transaction::new(&[&attacker], message, svm.latest_blockhash());
+        let error = svm.send_transaction(tx).unwrap_err();
+        assert!(format!("{:?}", error.err).contains("InvalidInstructionData"));
     }
 }
